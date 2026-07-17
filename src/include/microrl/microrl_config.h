@@ -107,7 +107,9 @@ extern "C" {
 
 /**
  * \brief           Enable it, if you want to allow quoting command arguments to include spaces.
- *                  Quoting protects whitespace, for example, 2 quoted tokens:
+ *                  Quoting protects whitespace and supports adjacent quoted parts. A matching
+ *                  quote closes the quoted section; a backslash escapes a matching quote.
+ *                  For example, 2 quoted tokens:
  *                  "> set wifi "Home Net" "secret password"
  */
 #ifndef MICRORL_CFG_USE_QUOTING

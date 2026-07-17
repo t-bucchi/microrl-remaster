@@ -65,7 +65,8 @@ typedef enum {
     microrlERRPAR = 0x02,                        /*!< Parameter error */
     microrlERRTKNNUM = 0x03,                     /*!< Too many tokens */
     microrlERRCLFULL = 0x04,                     /*!< Command line is full */
-    microrlERRCPLT = 0x05                        /*!< Auto-completion error */
+    microrlERRCPLT = 0x05,                       /*!< Auto-completion error */
+    microrlERRQUOTE = 0x06                      /*!< Unclosed quote */
 } microrlr_t;
 
 /**
@@ -161,6 +162,7 @@ typedef struct microrl {
     char* prompt_ptr;                           /*!< Pointer to prompt string */
     size_t prompt_size;                          /*!< Size of prompt string */
     char cmdline_str[MICRORL_CFG_CMDLINE_LEN + 1];  /*!< Command line input buffer with NULL character */
+    char token_buf[MICRORL_CFG_CMDLINE_LEN + 1];    /*!< Parsed command line token buffer */
     size_t cmdlen;                              /*!< Command length in command line buffer */
     size_t cursor;                              /*!< Command line buffer position pointer */
     char last_endl;                             /*!< Either 0 or the CR or LF that just triggered a newline */

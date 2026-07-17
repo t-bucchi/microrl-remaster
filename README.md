@@ -39,7 +39,7 @@ Microrl library is designed to help implement command line interface in small an
     * Command completion via completion callback
 
   - Quoting (optional)
-    * Use single `'` or double `"` quotes around a command argument that needs to include space characters
+    * Use single `'` or double `"` quotes around a command argument that needs to include space characters. Adjacent quoted parts are joined, and a backslash escapes a matching quote, for example `"aaa""bbb"` becomes `aaabbb` and `"aaa\\"bbb"` becomes `aaa"bbb`.
 
   - Echo control (optional)
     * Use `microrl_set_echo()` function to turn on or turn off echo

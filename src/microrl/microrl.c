@@ -103,63 +103,94 @@ typedef enum {
  */
 static microrlr_t prv_cmdline_buf_split(microrl_t* mrl, const char** tkn_str_arr, uint8_t* tkn_cnt_ptr, size_t limit) {
     uint8_t num = 0;
-    char *str = mrl->cmdline_str;
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+    char quote = '\0';
+    char *src = mrl->cmdline_str;
+    char *dst = mrl->token_buf;
 
-    /* Process complete string */
-    while (*str != '\0') {
+    while (src_pos < limit && src[src_pos] != '\0') {
 #if MICRORL_CFG_USE_QUOTING
-        if (*str == '"' || *str == '\'') {      /* Check if it starts with quote to handle escapes */
-            ++str;
-            tkn_str_arr[num++] = str;           /* Set start of argument after quotes */
-
-            while (*str != '\0') {              /* Process until end of quote */
-                if (!((size_t)(str - mrl->cmdline_str) < limit)) {
-                    tkn_str_arr[--num] = NULL;
-                    *tkn_cnt_ptr = num;
-                    return microrlOK;
-                }
-
-                if (*str == '\\') {
-                    ++str;
-                    if (*str == '"' || *str == '\'') {
-                        ++str;
-                    }
-                } else if (*str == '"' || *str == '\'') {
-                    *str = '\0';
-                    ++str;
-                    break;
-                } else {
-                    ++str;
-                }
-            }
-        } else {
-#endif /* MICRORL_CFG_USE_QUOTING */
-            tkn_str_arr[num++] = str;           /* Set start of argument directly on character */
-            while ((*str != ' ' && *str != '\0')) {
-                if (!((size_t)(str - mrl->cmdline_str) < limit)) {
-                    tkn_str_arr[--num] = NULL;
-                    *tkn_cnt_ptr = num;
-                    return microrlOK;
-                }
-#if MICRORL_CFG_USE_QUOTING
-                if (*str == '"' || *str == '\'') {   /* Quote should not be here... */
-                    *str = '\0';                /* ...add NULL termination to end token */
-                }
-#endif /* MICRORL_CFG_USE_QUOTING */
-                ++str;
-            }
-            if (*str == '\0') {
-                break;
-            }
-            *str = '\0';
-            ++str;
-#if MICRORL_CFG_USE_QUOTING
+        while (src_pos < limit && src[src_pos] == ' ') {
+            ++src_pos;
         }
-#endif /* MICRORL_CFG_USE_QUOTING */
-        if (num == MICRORL_CFG_CMD_TOKEN_NMB && *str != '\0') {     /* Check for number of tokens */
+        if (src_pos >= limit || src[src_pos] == '\0') {
+            break;
+        }
+#else
+        if (src[src_pos] == ' ') {
+            ++src_pos;
+            continue;
+        }
+#endif
+
+        if (num >= MICRORL_CFG_CMD_TOKEN_NMB) {
             return microrlERRTKNNUM;
         }
+        tkn_str_arr[num++] = &dst[dst_pos];
+        uint8_t in_token = 0;
+
+        while (src_pos < limit && src[src_pos] != '\0') {
+            char ch = src[src_pos];
+#if MICRORL_CFG_USE_QUOTING
+            if (quote != '\0') {
+                in_token = 1;
+                if (ch == '\\' && src_pos + 1 < limit &&
+                    (src[src_pos + 1] == quote || src[src_pos + 1] == '\\')) {
+                    dst[dst_pos++] = src[src_pos + 1];
+                    src_pos += 2;
+                } else if (ch == quote) {
+                    quote = '\0';
+                    ++src_pos;
+                } else {
+                    dst[dst_pos++] = ch;
+                    ++src_pos;
+                }
+            } else if (ch == '"' || ch == '\'') {
+                quote = ch;
+                in_token = 1;
+                ++src_pos;
+            } else if (ch == ' ') {
+                break;
+            } else if (ch == '\\' && src_pos + 1 < limit &&
+                       (src[src_pos + 1] == '"' || src[src_pos + 1] == '\'' ||
+                        src[src_pos + 1] == '\\')) {
+                dst[dst_pos++] = src[src_pos + 1];
+                src_pos += 2;
+            } else {
+                dst[dst_pos++] = ch;
+                in_token = 1;
+                ++src_pos;
+            }
+#else
+            if (ch == ' ') {
+                break;
+            }
+            dst[dst_pos++] = ch;
+            in_token = 1;
+            ++src_pos;
+#endif /* MICRORL_CFG_USE_QUOTING */
+        }
+
+#if MICRORL_CFG_USE_QUOTING
+        if (quote != '\0') {
+            *tkn_cnt_ptr = 0;
+            return microrlERRQUOTE;
+        }
+#endif /* MICRORL_CFG_USE_QUOTING */
+
+        if (in_token) {
+            dst[dst_pos++] = '\0';
+        } else {
+            --num;
+        }
+
+        while (src_pos < limit && src[src_pos] == ' ') {
+            ++src_pos;
+        }
     }
+
+    dst[dst_pos] = '\0';
 
     *tkn_cnt_ptr = num;
     return microrlOK;
@@ -678,8 +709,11 @@ static microrlr_t prv_handle_newline(microrl_t* mrl) {
 #else
         mrl->exec_fn(mrl, tkn_cnt, tkn_str_arr);
 #endif /* MICRORL_CFG_USE_COMMAND_HOOKS */
-    } else {
+    } else if (status == microrlERRTKNNUM) {
         mrl->out_fn(mrl, "ERROR: too many tokens");
+        prv_terminal_newline(mrl);
+    } else if (status == microrlERRQUOTE) {
+        mrl->out_fn(mrl, "ERROR: unclosed quote");
         prv_terminal_newline(mrl);
     }
 
@@ -742,8 +776,16 @@ static microrlr_t prv_complete_get_input(microrl_t* mrl) {
         return microrlERRCPLT;
     }
 
-    if (mrl->cmdline_str[mrl->cursor - 1] == '\0') {
+    if (tkn_cnt == 0) {
+        tkn_str_arr[tkn_cnt++] = "";
+        tkn_str_arr[tkn_cnt] = NULL;
+    }
+
+    if (mrl->cursor > 0 && mrl->cmdline_str[mrl->cursor - 1] == ' ') {
         /* Last char is whitespace */
+        if (tkn_cnt >= MICRORL_CFG_CMD_TOKEN_NMB) {
+            return microrlERRCPLT;
+        }
         tkn_str_arr[tkn_cnt++] = "";
         tkn_str_arr[tkn_cnt] = NULL;
     }
@@ -780,13 +822,6 @@ static microrlr_t prv_complete_get_input(microrl_t* mrl) {
     /* Insert end space if completion is performed */
     if (cmplt_tkn_arr[1] == NULL) {
         prv_cmdline_buf_insert_text(mrl, " ", 1);
-    }
-
-    /* Restore whitespaces replaced with '0' when command line buffer was split */
-    if (tkn_cnt != 0) {
-        for (size_t i = 0; i < (size_t)(tkn_cnt - 1); ++i) {
-            memset((char*)tkn_str_arr[i] + strlen(tkn_str_arr[i]), ' ', 1);
-        }
     }
 
     prv_terminal_print_line(mrl, pos, 0);
