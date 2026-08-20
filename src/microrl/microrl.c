@@ -34,7 +34,141 @@
 #include <stdio.h>
 #endif /* MICRORL_CFG_USE_LIBC_STDIO */
 
-#define IS_CONTROL_CHAR(x)                  ((x) <= MICRORL_ESC_ANSI_US || (x) == MICRORL_ESC_ANSI_DEL)
+#define IS_CONTROL_CHAR(x)                  \
+    ((unsigned char)(x) <= MICRORL_ESC_ANSI_US || \
+     (unsigned char)(x) == MICRORL_ESC_ANSI_DEL)
+
+static int utf8_is_continuation(unsigned char byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+static size_t utf8_sequence_length(unsigned char first) {
+    if (first <= 0x7F) {
+        return 1;
+    }
+    if (first >= 0xC2 && first <= 0xDF) {
+        return 2;
+    }
+    if (first >= 0xE0 && first <= 0xEF) {
+        return 3;
+    }
+    if (first >= 0xF0 && first <= 0xF4) {
+        return 4;
+    }
+    return 0;
+}
+
+static int utf8_sequence_is_valid(const unsigned char* bytes, size_t len) {
+    if (len == 0 || utf8_sequence_length(bytes[0]) != len) {
+        return 0;
+    }
+
+    for (size_t i = 1; i < len; ++i) {
+        if (!utf8_is_continuation(bytes[i])) {
+            return 0;
+        }
+    }
+
+    if (len == 3) {
+        if (bytes[0] == 0xE0 && bytes[1] < 0xA0) {
+            return 0;
+        }
+        if (bytes[0] == 0xED && bytes[1] >= 0xA0) {
+            return 0;
+        }
+    } else if (len == 4) {
+        if (bytes[0] == 0xF0 && bytes[1] < 0x90) {
+            return 0;
+        }
+        if (bytes[0] == 0xF4 && bytes[1] >= 0x90) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static uint32_t utf8_decode(const unsigned char* bytes, size_t len) {
+    if (len == 1) {
+        return bytes[0];
+    }
+
+    uint32_t codepoint = bytes[0] & ((1U << (8 - len - 1)) - 1U);
+    for (size_t i = 1; i < len; ++i) {
+        codepoint = (codepoint << 6) | (bytes[i] & 0x3FU);
+    }
+    return codepoint;
+}
+
+static size_t utf8_next_char_length(const char* text, size_t pos, size_t len) {
+    if (pos >= len) {
+        return 0;
+    }
+
+    const unsigned char first = (unsigned char)text[pos];
+    const size_t sequence_len = utf8_sequence_length(first);
+    if (sequence_len == 0 || pos + sequence_len > len ||
+        !utf8_sequence_is_valid((const unsigned char*)&text[pos], sequence_len)) {
+        return 1;
+    }
+    return sequence_len;
+}
+
+static size_t utf8_previous_char_length(const char* text, size_t pos) {
+    if (pos == 0) {
+        return 0;
+    }
+
+    size_t start = pos - 1;
+    while (start > 0 && utf8_is_continuation((unsigned char)text[start])) {
+        --start;
+    }
+
+    const size_t sequence_len = pos - start;
+    if (utf8_sequence_is_valid((const unsigned char*)&text[start], sequence_len)) {
+        return sequence_len;
+    }
+    return 1;
+}
+
+static int utf8_codepoint_width(uint32_t codepoint) {
+    if (codepoint < 0x20 || (codepoint >= 0x7F && codepoint < 0xA0)) {
+        return 0;
+    }
+
+    if ((codepoint >= 0x1100 && codepoint <= 0x115F) ||
+        (codepoint >= 0x2329 && codepoint <= 0x232A) ||
+        (codepoint >= 0x2E80 && codepoint <= 0xA4CF) ||
+        (codepoint >= 0xAC00 && codepoint <= 0xD7A3) ||
+        (codepoint >= 0xF900 && codepoint <= 0xFAFF) ||
+        (codepoint >= 0xFE10 && codepoint <= 0xFE19) ||
+        (codepoint >= 0xFE30 && codepoint <= 0xFE6F) ||
+        (codepoint >= 0xFF01 && codepoint <= 0xFF60) ||
+        (codepoint >= 0xFFE0 && codepoint <= 0xFFE6) ||
+        (codepoint >= 0x1F300 && codepoint <= 0x1FAFF)) {
+        return 2;
+    }
+
+    return 1;
+}
+
+static size_t utf8_display_width(const char* text, size_t start, size_t end) {
+    size_t width = 0;
+    size_t pos = start;
+    while (pos < end) {
+        const size_t char_len = utf8_next_char_length(text, pos, end);
+        const size_t safe_len = char_len == 0 ? 1 : char_len;
+        width += (size_t)utf8_codepoint_width(
+            utf8_decode((const unsigned char*)&text[pos], safe_len));
+        pos += safe_len;
+    }
+    return width;
+}
+
+static void utf8_reset_pending(microrl_t* mrl) {
+    mrl->utf8_pending_len = 0;
+    mrl->utf8_pending_expected = 0;
+}
 
 /**
  * \brief           List of ANSI escape codes
@@ -248,16 +382,18 @@ static void prv_cmdline_buf_backspace(microrl_t* mrl, size_t len) {
  * \brief           Remove one characters forward at cursor
  * \param[in,out]   mrl: \ref microrl_t working instance
  */
-static void prv_cmdline_buf_delete(microrl_t* mrl) {
-    if ((mrl->cmdlen == 0) || (mrl->cursor == mrl->cmdlen)) {
+static void prv_cmdline_buf_delete(microrl_t* mrl, size_t len) {
+    if ((mrl->cmdlen == 0) || (mrl->cursor == mrl->cmdlen) || len == 0) {
         return;
     }
 
+    if (mrl->cursor + len > mrl->cmdlen) {
+        len = mrl->cmdlen - mrl->cursor;
+    }
     memmove(mrl->cmdline_str + mrl->cursor,
-            mrl->cmdline_str + mrl->cursor + 1,
-            mrl->cmdlen - mrl->cursor + 1);
-    mrl->cmdline_str[mrl->cmdlen] = '\0';
-    --mrl->cmdlen;
+            mrl->cmdline_str + mrl->cursor + len,
+            mrl->cmdlen - mrl->cursor - len + 1);
+    mrl->cmdlen -= len;
 }
 
 /**
@@ -268,6 +404,7 @@ MICRORL_CFG_STATIC_INLINE void prv_cmdline_buf_reset(microrl_t* mrl) {
     memset(mrl->cmdline_str, 0x00, sizeof(mrl->cmdline_str));
     mrl->cmdlen = 0;
     mrl->cursor = 0;
+    utf8_reset_pending(mrl);
 }
 
 /**
@@ -289,8 +426,23 @@ MICRORL_CFG_STATIC_INLINE void prv_terminal_print_prompt(microrl_t* mrl) {
  *                      and move the cursor to its position
  * \param[in]       mrl: \ref microrl_t working instance
  */
-MICRORL_CFG_STATIC_INLINE void prv_terminal_backspace(microrl_t* mrl) {
-    mrl->out_fn(mrl, "\033[D \033[D");
+static char* prv_cursor_generate_move(char* str, int32_t offset);
+
+MICRORL_CFG_STATIC_INLINE void prv_terminal_backspace(microrl_t* mrl, size_t width) {
+    if (width == 0) {
+        return;
+    }
+
+    char move[16];
+    prv_cursor_generate_move(move, -(int32_t)width);
+    mrl->out_fn(mrl, move);
+
+    for (size_t i = 0; i < width; ++i) {
+        mrl->out_fn(mrl, " ");
+    }
+
+    prv_cursor_generate_move(move, -(int32_t)width);
+    mrl->out_fn(mrl, move);
 }
 
 /**
@@ -375,48 +527,51 @@ static void prv_terminal_move_cursor(microrl_t* mrl, int32_t offset) {
  * \param[in]       reset: Flag to reset the cursor position
  */
 static void prv_terminal_print_line(microrl_t* mrl, int32_t pos, uint8_t reset) {
-    char str[MICRORL_CFG_PRINT_BUFFER_LEN] = {0};
-    char* str_ptr = str;
-
-    if (reset) {
-#if MICRORL_CFG_USE_CARRIAGE_RETURN
-        *str_ptr++ = '\r';
-        str_ptr = prv_cursor_generate_move(str_ptr, mrl->prompt_size + pos);
-#else
-        str_ptr = prv_cursor_generate_move(str_ptr, -(MICRORL_ARRAYSIZE(mrl->cmdline_str) - 1 + mrl->prompt_size + 2));
-        str_ptr = prv_cursor_generate_move(str_ptr, mrl->prompt_size + pos);
-#endif /* MICRORL_CFG_USE_CARRIAGE_RETURN */
+    if (pos < 0) {
+        pos = 0;
+    }
+    if ((size_t)pos > mrl->cmdlen) {
+        pos = (int32_t)mrl->cmdlen;
     }
 
-    for (size_t i = pos; i < mrl->cmdlen; ++i) {
-        *str_ptr = mrl->cmdline_str[i];
+    if (reset) {
+        char str[16];
+#if MICRORL_CFG_USE_CARRIAGE_RETURN
+        mrl->out_fn(mrl, "\r");
+        prv_cursor_generate_move(str, (int32_t)(mrl->prompt_size +
+            utf8_display_width(mrl->cmdline_str, 0, (size_t)pos)));
+#else
+        prv_cursor_generate_move(str, -(int32_t)(MICRORL_ARRAYSIZE(mrl->cmdline_str) -
+            1 + mrl->prompt_size + 2));
+        mrl->out_fn(mrl, str);
+        prv_cursor_generate_move(str, (int32_t)(mrl->prompt_size +
+            utf8_display_width(mrl->cmdline_str, 0, (size_t)pos)));
+#endif /* MICRORL_CFG_USE_CARRIAGE_RETURN */
+        mrl->out_fn(mrl, str);
+    }
+
+    size_t i = (size_t)pos;
+    while (i < mrl->cmdlen) {
+        const size_t char_len = utf8_next_char_length(mrl->cmdline_str, i,
+                                                       mrl->cmdlen);
+        char text[5] = {0};
 
 #if MICRORL_CFG_USE_ECHO_OFF
         if (((int32_t)i >= mrl->echo_off_pos) && (mrl->echo != MICRORL_ECHO_ON)) {
-            *str_ptr = MICRORL_CFG_ECHO_OFF_MASK;
-        }
+            text[0] = MICRORL_CFG_ECHO_OFF_MASK;
+        } else
 #endif /* MICRORL_CFG_USE_ECHO_OFF */
-
-        ++str_ptr;
-
-        if ((size_t)(str_ptr - str) == strlen(str)) {
-            *str_ptr = '\0';
-            mrl->out_fn(mrl, str);
-            str_ptr = str;
+        {
+            memcpy(text, &mrl->cmdline_str[i], char_len);
+            text[char_len] = '\0';
         }
+        mrl->out_fn(mrl, text);
+        i += char_len;
     }
 
-    if ((size_t)(str_ptr - str + 3 + 6 + 1) > MICRORL_ARRAYSIZE(str)) {
-        *str_ptr = '\0';
-        mrl->out_fn(mrl, str);
-        str_ptr = str;
-    }
-
-    *str_ptr++ = '\033';                        /* Delete all past end of text */
-    *str_ptr++ = '[';
-    *str_ptr++ = 'K';
-    prv_cursor_generate_move(str_ptr, mrl->cursor - mrl->cmdlen);
-    mrl->out_fn(mrl, str);
+    mrl->out_fn(mrl, "\033[K");                /* Delete all past end of text */
+    prv_terminal_move_cursor(mrl, -(int32_t)utf8_display_width(
+        mrl->cmdline_str, mrl->cursor, mrl->cmdlen));
 }
 
 #if MICRORL_CFG_USE_HISTORY || __DOXYGEN__
@@ -607,7 +762,9 @@ static uint8_t prv_escape_process(microrl_t* mrl, char ch) {
         mrl->esc_code = MICRORL_ESC_BRACKET;
         return 0;
     } else if (ch == MICRORL_ESC_ANSI_DEL) {    /* Alt+BACKSPACE */
-        prv_cmdline_buf_delete(mrl);
+        prv_cmdline_buf_delete(mrl, utf8_next_char_length(mrl->cmdline_str,
+                                                           mrl->cursor,
+                                                           mrl->cmdlen));
         prv_terminal_print_line(mrl, mrl->cursor, 0);
         return 1;
     } else if (mrl->esc_code == MICRORL_ESC_BRACKET) {
@@ -623,14 +780,21 @@ static uint8_t prv_escape_process(microrl_t* mrl, char ch) {
             return 1;
         } else if (ch == 'C') {                 /* RIGHT */
             if (mrl->cursor < mrl->cmdlen) {
-                prv_terminal_move_cursor(mrl, 1);
-                ++mrl->cursor;
+                const size_t char_len = utf8_next_char_length(mrl->cmdline_str,
+                                                               mrl->cursor,
+                                                               mrl->cmdlen);
+                prv_terminal_move_cursor(mrl, (int32_t)utf8_display_width(
+                    mrl->cmdline_str, mrl->cursor, mrl->cursor + char_len));
+                mrl->cursor += char_len;
             }
             return 1;
         } else if (ch == 'D') {                 /* LEFT */
             if (mrl->cursor > 0) {
-                prv_terminal_move_cursor(mrl, -1);
-                --mrl->cursor;
+                const size_t char_len = utf8_previous_char_length(mrl->cmdline_str,
+                                                                   mrl->cursor);
+                prv_terminal_move_cursor(mrl, -(int32_t)utf8_display_width(
+                    mrl->cmdline_str, mrl->cursor - char_len, mrl->cursor));
+                mrl->cursor -= char_len;
             }
             return 1;
         } else if (ch == '7' || ch == '1') {
@@ -645,15 +809,19 @@ static uint8_t prv_escape_process(microrl_t* mrl, char ch) {
         }
     } else if (ch == '~') {
         if (mrl->esc_code == MICRORL_ESC_HOME) {/* HOME */
-            prv_terminal_move_cursor(mrl, -mrl->cursor);
+            prv_terminal_move_cursor(mrl, -(int32_t)utf8_display_width(
+                mrl->cmdline_str, 0, mrl->cursor));
             mrl->cursor = 0;
             return 1;
         } else if (mrl->esc_code == MICRORL_ESC_END) {  /* END */
-            prv_terminal_move_cursor(mrl, mrl->cmdlen - mrl->cursor);
+            prv_terminal_move_cursor(mrl, (int32_t)utf8_display_width(
+                mrl->cmdline_str, mrl->cursor, mrl->cmdlen));
             mrl->cursor = mrl->cmdlen;
             return 1;
         } else if (mrl->esc_code == MICRORL_ESC_DEL) {  /* DELETE */
-            prv_cmdline_buf_delete(mrl);
+            prv_cmdline_buf_delete(mrl, utf8_next_char_length(mrl->cmdline_str,
+                                                               mrl->cursor,
+                                                               mrl->cmdlen));
             prv_terminal_print_line(mrl, mrl->cursor, 0);
             return 1;
         }
@@ -932,8 +1100,9 @@ static size_t prv_calculate_prompt_size(const char* prompt_str) {
                 ++ptr;                        // Move past 'm'
             }
         } else {
-            ++size;                           // Count regular character
-            ++ptr;
+            const size_t char_len = utf8_next_char_length(ptr, 0, strlen(ptr));
+            size += utf8_display_width(ptr, 0, char_len);
+            ptr += char_len;
         }
     }
 
@@ -1022,26 +1191,35 @@ static microrlr_t prv_control_char_process(microrl_t* mrl, char ch) {
             break;
         }
         case MICRORL_ESC_ANSI_ENQ: { /* ^E */
-            prv_terminal_move_cursor(mrl, mrl->cmdlen - mrl->cursor);
+            prv_terminal_move_cursor(mrl, (int32_t)utf8_display_width(
+                mrl->cmdline_str, mrl->cursor, mrl->cmdlen));
             mrl->cursor = mrl->cmdlen;
             break;
         }
         case MICRORL_ESC_ANSI_SOH: { /* ^A */
-            prv_terminal_move_cursor(mrl, -mrl->cursor);
+            prv_terminal_move_cursor(mrl, -(int32_t)utf8_display_width(
+                mrl->cmdline_str, 0, mrl->cursor));
             mrl->cursor = 0;
             break;
         }
         case MICRORL_ESC_ANSI_ACK: { /* ^F */
             if (mrl->cursor < mrl->cmdlen) {
-                prv_terminal_move_cursor(mrl, 1);
-                ++mrl->cursor;
+                const size_t char_len = utf8_next_char_length(mrl->cmdline_str,
+                                                               mrl->cursor,
+                                                               mrl->cmdlen);
+                prv_terminal_move_cursor(mrl, (int32_t)utf8_display_width(
+                    mrl->cmdline_str, mrl->cursor, mrl->cursor + char_len));
+                mrl->cursor += char_len;
             }
             break;
         }
         case MICRORL_ESC_ANSI_STX: { /* ^B */
             if (mrl->cursor != 0) {
-                prv_terminal_move_cursor(mrl, -1);
-                --mrl->cursor;
+                const size_t char_len = utf8_previous_char_length(mrl->cmdline_str,
+                                                                   mrl->cursor);
+                prv_terminal_move_cursor(mrl, -(int32_t)utf8_display_width(
+                    mrl->cmdline_str, mrl->cursor - char_len, mrl->cursor));
+                mrl->cursor -= char_len;
             }
             break;
         }
@@ -1060,9 +1238,13 @@ static microrlr_t prv_control_char_process(microrl_t* mrl, char ch) {
         case MICRORL_ESC_ANSI_DEL:  /* Backspace */
         case MICRORL_ESC_ANSI_BS: { /* ^H */
             if (mrl->cursor > 0) {
-                prv_cmdline_buf_backspace(mrl, 1);
+                const size_t char_len = utf8_previous_char_length(mrl->cmdline_str,
+                                                                   mrl->cursor);
+                const size_t char_width = utf8_display_width(
+                    mrl->cmdline_str, mrl->cursor - char_len, mrl->cursor);
+                prv_cmdline_buf_backspace(mrl, char_len);
                 if (mrl->cursor == mrl->cmdlen) {
-                    prv_terminal_backspace(mrl);
+                    prv_terminal_backspace(mrl, char_width);
                 } else {
                     prv_terminal_print_line(mrl, mrl->cursor, 1);
                 }
@@ -1070,7 +1252,9 @@ static microrlr_t prv_control_char_process(microrl_t* mrl, char ch) {
             break;
         }
         case MICRORL_ESC_ANSI_EOT: { /* ^D */
-            prv_cmdline_buf_delete(mrl);
+            prv_cmdline_buf_delete(mrl, utf8_next_char_length(mrl->cmdline_str,
+                                                               mrl->cursor,
+                                                               mrl->cmdlen));
             prv_terminal_print_line(mrl, mrl->cursor, 0);
             break;
         }
@@ -1106,24 +1290,32 @@ static microrlr_t prv_control_char_process(microrl_t* mrl, char ch) {
  * \param[in]       ch: Character to print
  * \return          \ref microrlOK on success, member of \ref microrlr_t enumeration otherwise
  */
-static microrlr_t prv_insert_char(microrl_t* mrl, char ch) {
-    if (prv_cmdline_buf_insert_text(mrl, &ch, 1) != microrlOK) {
+static microrlr_t prv_insert_text(microrl_t* mrl, const char* text, size_t len) {
+    const size_t start = mrl->cursor;
+    if (prv_cmdline_buf_insert_text(mrl, text, len) != microrlOK) {
         return microrlERRCLFULL;
     }
+
     if (mrl->cursor == mrl->cmdlen) {
-        char nch[] = {0, 0};
-        nch[0] = ch;
 #if MICRORL_CFG_USE_ECHO_OFF
         if (((int32_t)mrl->cursor >= mrl->echo_off_pos) && (mrl->echo != MICRORL_ECHO_ON)) {
-            nch[0] = MICRORL_CFG_ECHO_OFF_MASK;
-        }
+            mrl->out_fn(mrl, "*");
+        } else
 #endif /* MICRORL_CFG_USE_ECHO_OFF */
-        mrl->out_fn(mrl, nch);
+        {
+            char output[5] = {0};
+            memcpy(output, text, len);
+            mrl->out_fn(mrl, output);
+        }
     } else {
-        prv_terminal_print_line(mrl, mrl->cursor - 1, 0);
+        prv_terminal_print_line(mrl, (int32_t)start, 0);
     }
 
     return microrlOK;
+}
+
+static microrlr_t prv_insert_char(microrl_t* mrl, char ch) {
+    return prv_insert_text(mrl, &ch, 1);
 }
 
 /**
@@ -1133,53 +1325,83 @@ static microrlr_t prv_insert_char(microrl_t* mrl, char ch) {
  * \param[in]       len: Length of data for input
  * \return          \ref microrlOK on success, member of \ref microrlr_t enumeration otherwise
  */
+static microrlr_t prv_process_input_byte(microrl_t* mrl, unsigned char byte) {
+    char ch = (char)byte;
+
+#if MICRORL_CFG_USE_ESC_SEQ
+    if (mrl->escape) {
+        if (prv_escape_process(mrl, ch)) {
+            mrl->escape = 0;
+        }
+        return microrlOK;
+    }
+#endif /* MICRORL_CFG_USE_ESC_SEQ */
+
+    if (mrl->utf8_pending_len != 0) {
+        if (utf8_is_continuation(byte)) {
+            mrl->utf8_pending[mrl->utf8_pending_len++] = byte;
+            if (mrl->utf8_pending_len < mrl->utf8_pending_expected) {
+                return microrlOK;
+            }
+
+            if (utf8_sequence_is_valid(mrl->utf8_pending,
+                                       mrl->utf8_pending_expected)) {
+                microrlr_t result = prv_insert_text(
+                    mrl, (const char*)mrl->utf8_pending,
+                    mrl->utf8_pending_expected);
+                utf8_reset_pending(mrl);
+                return result;
+            }
+            utf8_reset_pending(mrl);
+            return microrlOK;
+        }
+        utf8_reset_pending(mrl);
+    }
+
+    if (byte >= 0x80) {
+        const size_t expected = utf8_sequence_length(byte);
+        if (expected > 1 && expected <= sizeof(mrl->utf8_pending)) {
+            mrl->utf8_pending[0] = byte;
+            mrl->utf8_pending_len = 1;
+            mrl->utf8_pending_expected = (uint8_t)expected;
+        }
+        return microrlOK;
+    }
+
+    if ((ch == MICRORL_ESC_ANSI_CR) || (ch == MICRORL_ESC_ANSI_LF)) {
+        /* Only trigger a newline if `ch` doesn't follow its companion. */
+        if (mrl->last_endl == (ch == MICRORL_ESC_ANSI_CR ?
+                               MICRORL_ESC_ANSI_LF : MICRORL_ESC_ANSI_CR)) {
+            mrl->last_endl = 0;
+        } else {
+            mrl->last_endl = ch;
+            if (prv_handle_newline(mrl) != microrlOK) {
+                return microrlERRTKNNUM;
+            }
+        }
+        return microrlOK;
+    }
+    mrl->last_endl = 0;
+
+    if (IS_CONTROL_CHAR(ch)) {
+        return prv_control_char_process(mrl, ch);
+    }
+    if ((ch == ' ') && (mrl->cmdlen == 0)) {
+        return microrlOK;
+    }
+    return prv_insert_char(mrl, ch);
+}
+
 microrlr_t microrl_processing_input(microrl_t* mrl, const void* data_ptr, size_t len) {
     if (mrl == NULL || data_ptr == NULL || len == 0) {
         return microrlERRPAR;
     }
 
-    char* buf_ptr = (char*)data_ptr;
-
+    const unsigned char* buf_ptr = (const unsigned char*)data_ptr;
     while (len-- != 0) {
-        char ch = *buf_ptr++;
-
-#if MICRORL_CFG_USE_ESC_SEQ
-        if (mrl->escape) {
-            if (prv_escape_process(mrl, ch)) {
-                mrl->escape = 0;
-            }
-            continue;
-        }
-#endif /* MICRORL_CFG_USE_ESC_SEQ */
-
-        if ((ch == MICRORL_ESC_ANSI_CR) || (ch == MICRORL_ESC_ANSI_LF)) {
-            /*
-             * Only trigger a newline if `ch` doen't follow its companion's
-             * triggering a newline.
-             */
-            if (mrl->last_endl == (ch == MICRORL_ESC_ANSI_CR ? MICRORL_ESC_ANSI_LF : MICRORL_ESC_ANSI_CR)) {
-                mrl->last_endl = 0;             /* Ignore char, but clear newline state */
-            } else {
-                mrl->last_endl = ch;
-                if (prv_handle_newline(mrl) != microrlOK) {
-                    return microrlERRTKNNUM;
-                }
-            }
-            continue;
-        }
-        mrl->last_endl = 0;
-
-        microrlr_t res = microrlOK;
-        if (IS_CONTROL_CHAR(ch)) {
-            res = prv_control_char_process(mrl, ch);
-        } else {
-            if ((ch == ' ') && (mrl->cmdlen == 0)) {    /* Skip spaces before first command line symbol */
-                break;
-            }
-            res = prv_insert_char(mrl, ch);
-        }
-        if (res != microrlOK) {
-            return res;
+        microrlr_t result = prv_process_input_byte(mrl, *buf_ptr++);
+        if (result != microrlOK) {
+            return result;
         }
     }
 

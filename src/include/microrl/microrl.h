@@ -167,6 +167,10 @@ typedef struct microrl {
     size_t cursor;                              /*!< Command line buffer position pointer */
     char last_endl;                             /*!< Either 0 or the CR or LF that just triggered a newline */
 
+    uint8_t utf8_pending[4];                     /*!< Incomplete UTF-8 input sequence */
+    uint8_t utf8_pending_len;                    /*!< Number of bytes in pending sequence */
+    uint8_t utf8_pending_expected;               /*!< Expected length of pending sequence */
+
 #if MICRORL_CFG_USE_ESC_SEQ || __DOXYGEN__
     microrl_esc_code_t esc_code;                /*!< Code of first escape sequence symbol */
     uint8_t escape;                             /*!< Escape sequence caught flag */
